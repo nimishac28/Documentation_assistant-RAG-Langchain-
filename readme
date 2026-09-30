@@ -1,1 +1,136 @@
-Documentation Assistant using RAG and Langchain
+# LangChain Documentation Assistant (RAG + Agent)
+
+Ask questions about the LangChain docs in plain English and get answers grounded in the documentation, with source links. The pipeline crawls the docs site, indexes it in Pinecone, and uses a LangChain agent that decides when to retrieve context before answering.
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/nimishac28/Documentation_assistant-RAG-Langchain-/blob/main/BuildDocumentation_Assistant.ipynb)
+
+## Why
+
+LLMs answer questions about fast-moving libraries from outdated training data. LangChain's API changes often, so a model's memory of it goes stale quickly. Retrieval-augmented generation (RAG) fixes this by fetching the current documentation at question time and making the model answer from it, citing where each claim came from.
+
+## How it works
+
+```
+INGESTION (run once)
+python.langchain.com ──► TavilyCrawl ──► LangChain Documents ──► Text splitter
+                         (depth 5,        (content + source URL)   (4000 chars,
+                          advanced                                  200 overlap)
+                          extraction)                                   │
+                                                                        ▼
+                             Pinecone index ◄── OpenAI embeddings ◄── Chunks
+                        "langchain-doc-index"   text-embedding-3-small
+                                                (async batch upload)
+
+QUERY (every question)
+User question ──► Agent (gpt-5.2) ──► calls retrieve_context tool ──► Pinecone
+                        │                                                │
+                        ◄──────────── top-k chunks + source URLs ◄───────┘
+                        │
+                        ▼
+              Answer with cited sources + list of retrieved documents
+```
+
+### 1. Ingestion
+- **Crawl:** `TavilyCrawl` walks the LangChain docs site (max depth 5, advanced extraction) and returns raw page content with URLs.
+- **Wrap:** each page becomes a LangChain `Document`, with the URL stored as `source` metadata so answers can cite it.
+- **Chunk:** `RecursiveCharacterTextSplitter` splits pages into 4,000-character chunks with 200-character overlap.
+- **Embed and store:** chunks are embedded with OpenAI `text-embedding-3-small` and written to Pinecone. Batches are uploaded concurrently with `asyncio.gather`, and each batch's success or failure is logged separately so one failure doesn't stop the rest.
+
+### 2. Retrieval and answering
+- **Tool:** `retrieve_context` searches Pinecone for the chunks closest to the query. It uses `response_format="content_and_artifact"`, which sends formatted text to the model while keeping the raw `Document` objects available to the code.
+- **Agent:** `create_agent` wraps the chat model and the tool. The system prompt tells it to retrieve before answering, cite sources, and say so when the docs don't contain the answer.
+- **Output:** `run_llm()` returns a dictionary with the final `answer` and the `context` documents that were retrieved, pulled from the agent's `ToolMessage` artifacts. The context can be shown in a UI or used for evaluation.
+
+## Tech stack
+
+| Layer | Tool |
+|---|---|
+| Crawling | Tavily (`langchain-tavily`: `TavilyCrawl`) |
+| Orchestration | LangChain (`create_agent`, `@tool`, text splitters) |
+| Embeddings | OpenAI `text-embedding-3-small` (1536 dimensions) |
+| Vector store | Pinecone |
+| LLM | OpenAI `gpt-5.2` via `init_chat_model` |
+| Tracing | LangSmith |
+
+## Results from the current run
+
+| Metric | Value |
+|---|---|
+| Pages crawled | 31 |
+| Chunks created | 156 |
+| Batches uploaded | 1/1 succeeded |
+
+**Example query:** `what are deep agents?`
+
+The agent retrieved context, answered that Deep Agents is LangChain's SDK for building agents, with Deep Agents Code as a terminal coding agent built on it, and listed its features (hooks, MCP tools, memory and skills, subagents, remote sandboxes) with source links.
+
+## Getting started
+
+### Prerequisites
+
+You need API keys for:
+- [OpenAI](https://platform.openai.com/) – embeddings and chat model
+- [Pinecone](https://www.pinecone.io/) – vector store
+- [Tavily](https://tavily.com/) – crawling
+- [LangSmith](https://smith.langchain.com/) – tracing (optional)
+
+**Create the Pinecone index first.** Name it `langchain-doc-index`, set dimension to **1536** (matches `text-embedding-3-small`), and use cosine similarity.
+
+### Run in Google Colab
+
+1. Open the notebook with the badge above.
+2. Add your keys in Colab's **Secrets** panel (🔑 icon) as `OPENAI_API_KEY`, `PINECONE_API_KEY`, `TAVILY_API_KEY`, and `LANGSMITH_API_KEY`. The notebook reads them with `userdata.get()`, so no keys appear in the code.
+3. Upload `logger.py` to the session (the ingestion cell imports its logging helpers).
+4. Run the install cell, then the ingestion and chunking cells **once** to fill the index.
+5. Run the RAG cell and change the query in `run_llm(query="...")`.
+
+### Run locally
+
+```bash
+git clone https://github.com/nimishac28/Documentation_assistant-RAG-Langchain-.git
+cd Documentation_assistant-RAG-Langchain-
+pip install langchain langchain-openai langchain-pinecone langchain-tavily \
+            langchain-classic python-dotenv certifi
+```
+
+Create a `.env` file (and add it to `.gitignore`):
+
+```
+OPENAI_API_KEY=...
+PINECONE_API_KEY=...
+TAVILY_API_KEY=...
+LANGSMITH_API_KEY=...
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=langchain_agent
+```
+
+Replace the `google.colab.userdata` lines with `load_dotenv()`, which is already imported.
+
+## Project structure
+
+```
+├── BuildDocumentation_Assistant.ipynb   # ingestion, chunking, indexing, RAG agent
+├── logger.py                            # coloured console logging helpers
+└── README.md
+```
+
+## Limitations
+
+- **Duplicate chunks in the index.** The ingestion cell was run more than once without stable document IDs, so the same chunk was stored several times. In the example query, all 8 retrieved chunks had identical text, which means the agent saw one piece of information instead of 8 different ones. Fix: clear the index and re-ingest, and give each chunk a deterministic ID (for example, a hash of source URL + chunk index) so re-runs overwrite instead of duplicating.
+- **Shallow crawl.** Only 31 pages were collected, and the example answer came from `llms.txt`, a page that lists links with one-line summaries, not from the full documentation pages. Answers are therefore thin on detail. Crawling `docs.langchain.com` directly, or following the links in `llms.txt`, would give the model real content.
+- **Large chunks.** At 4,000 characters, each chunk covers many topics, which weakens retrieval precision. Smaller chunks (around 1,000 characters) are worth testing.
+- **No evaluation.** Answer quality has been checked by eye only. There is no test set measuring retrieval hit rate or answer faithfulness.
+- **Notebook only.** There is no UI or API yet. The code relies on notebook-only features like top-level `await`.
+
+## Next steps
+
+- [ ] Deduplicate the index with deterministic chunk IDs
+- [ ] Crawl the full docs content, not just the index page
+- [ ] Tune chunk size and retrieval `k`, and compare results
+- [ ] Build a small question set and evaluate with LangSmith
+- [ ] Add a Streamlit chat UI that shows the answer next to its source documents
+- [ ] Move the code from the notebook into `ingestion.py` and `backend.py`
+
+## Author
+
+**Nimisha** – [GitHub](https://github.com/nimishac28) <!-- add LinkedIn -->
